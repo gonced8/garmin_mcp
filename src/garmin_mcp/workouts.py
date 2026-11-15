@@ -265,6 +265,42 @@ def _fix_repeat_group_step(step: dict) -> None:
         _fix_repeat_group_step(nested)
 
 
+def _validate_enum_blocks(step: dict, path: str) -> None:
+    """Reject unknown properties in controlled enum blocks, not entire Garmin DTOs."""
+    mappings = {
+        "stepType": ("stepTypeId", "stepTypeKey", {1: "warmup", 2: "cooldown", 3: "interval", 4: "recovery", 5: "rest", 6: "repeat"}),
+        "strokeType": ("strokeTypeId", "strokeTypeKey", {0: None, 2: "backstroke", 3: "breaststroke", 5: "fly", 6: "free"}),
+        "equipmentType": ("equipmentTypeId", "equipmentTypeKey", {1: "fins", 4: "pull_buoy"}),
+        "endCondition": ("conditionTypeId", "conditionTypeKey", END_CONDITION_TYPE_KEYS),
+    }
+    for field in ("targetType", "secondaryTargetType", *mappings):
+        value = step.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if field in _TARGET_FIELD_LAYOUTS:
+            allowed = {"workoutTargetTypeId", "workoutTargetTypeKey", "displayOrder"}
+            layout = _TARGET_FIELD_LAYOUTS[field]
+            allowed.update((*layout["bounds"], layout["zone"]))
+        else:
+            id_field, key_field, mapping = mappings[field]
+            allowed = {id_field, key_field, "displayOrder", "displayable"}
+            ident, key = value.get(id_field), value.get(key_field)
+            if isinstance(ident, str) and ident.isdigit():
+                ident = int(ident)
+            if field == "endCondition":
+                mapping = {}  # Existing validator provides canonical error messages.
+            if key_field in value and ident in mapping and key != mapping[ident]:
+                raise ValueError(f"{path}.{field} mismatch: {ident!r} requires {mapping[ident]!r}, got {key!r}")
+            reverse = {v: k for k, v in mapping.items()}
+            if key_field in value and key in reverse and ident is not None and ident != reverse[key]:
+                raise ValueError(f"{path}.{field} mismatch: {key!r} requires {reverse[key]}")
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"{path}.{field}: unknown properties {sorted(unknown)}")
+
+
 def _normalize_workout_steps(workout_data: dict) -> None:
     """Repair recoverable step-shape mistakes before validation and upload."""
     steps = list(_iter_workout_steps(workout_data))
@@ -272,6 +308,7 @@ def _normalize_workout_steps(workout_data: dict) -> None:
     # Preflight the complete workout so a later conflict cannot leave an
     # earlier step partially repaired.
     for step, path in steps:
+        _validate_enum_blocks(step, path)
         _validate_nested_target_fields(step, path)
     for step, _ in steps:
         _move_nested_target_fields(step)
@@ -1219,6 +1256,9 @@ def register_tools(app):
             }]
         }
 
+        Confirmation contract: executes immediately when called. No confirm or
+        _confirmationReason parameter; client approval metadata is client-managed.
+
         Args:
             workout_data: Dictionary containing workout structure (name, sport type, segments, etc.)
         """
@@ -1428,19 +1468,32 @@ def register_tools(app):
         }, indent=2)
 
     @app.tool()
-    async def get_scheduled_workouts(start_date: str, end_date: str) -> str:
+    async def get_scheduled_workouts(start_date: str, end_date: str, page_days: int = 31) -> str:
         """Get scheduled workouts between two dates with curated summary list
 
         Returns workouts that have been scheduled on the Garmin Connect calendar,
-        including their scheduled dates and completion status.
+        including their scheduled dates and completion status. Queries at most
+        page_days (1-31) per call. Follow next_start_date with the original end_date
+        until null, including when a page is empty. activity_id is exposed only
+        when Garmin provides associatedActivityId; completion alone is not proof.
 
         Args:
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
+            page_days: Maximum days per request, default 31
         """
         try:
             _validate_date(start_date, "start_date")
             _validate_date(end_date, "end_date")
+            if not 1 <= page_days <= 31:
+                raise ValueError("page_days must be between 1 and 31")
+            start = datetime.date.fromisoformat(start_date)
+            requested_end = datetime.date.fromisoformat(end_date)
+            if requested_end < start:
+                raise ValueError("end_date must not precede start_date")
+            page_end = min(requested_end, start + datetime.timedelta(days=page_days - 1))
+            next_start = (page_end + datetime.timedelta(days=1)).isoformat() if page_end < requested_end else None
+            end_date = page_end.isoformat()
             # Query for scheduled workouts using GraphQL
             query = {
                 "query": f'query{{workoutScheduleSummariesScalar(startDate:"{start_date}", endDate:"{end_date}")}}'
@@ -1455,13 +1508,15 @@ def register_tools(app):
             # crashing on None.
             scheduled = (result.get("data") or {}).get("workoutScheduleSummariesScalar") or []
 
-            if not scheduled:
+            if not scheduled and next_start is None:
                 return f"No workouts scheduled between {start_date} and {end_date}."
 
             # Curate the scheduled workout list
             curated = {
                 "count": len(scheduled),
                 "date_range": {"start": start_date, "end": end_date},
+                "next_start_date": next_start,
+                "requested_end_date": requested_end.isoformat(),
                 "scheduled_workouts": [_curate_scheduled_workout(s) for s in scheduled]
             }
 
@@ -1538,6 +1593,8 @@ def register_tools(app):
         Args:
             workout_id: ID of the workout to schedule (get IDs from get_workouts)
             calendar_date: Date to schedule the workout in YYYY-MM-DD format
+        Confirmation contract: executes immediately when called; no confirm or
+        _confirmationReason argument. Client approval metadata is client-managed.
         """
         try:
             _validate_date(calendar_date, "calendar_date")
@@ -1737,6 +1794,8 @@ def register_tools(app):
         Args:
             scheduled_workout_id: Calendar-entry id from get_scheduled_workouts
             calendar_date: New date in YYYY-MM-DD format
+        Confirmation contract: executes immediately when called; no confirm or
+        _confirmationReason argument. Client approval metadata is client-managed.
         """
         try:
             _validate_date(calendar_date, "calendar_date")
@@ -1812,6 +1871,8 @@ def register_tools(app):
 
         Args:
             scheduled_workout_id: Calendar-entry id from get_scheduled_workouts
+        Confirmation contract: executes immediately when called; no confirm or
+        _confirmationReason argument. Client approval metadata is client-managed.
         """
         try:
             # Delegate to the high-level garminconnect method. Its client.delete
