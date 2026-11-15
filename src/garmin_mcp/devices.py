@@ -366,6 +366,10 @@ def register_tools(app):
         not appear on the watch immediately. Scheduling a workout does not
         need this: scheduled workouts reach the watch's calendar on their own.
 
+        Pool swimming uses this same FIT delivery path. The API accepting the
+        queue request does not verify swim support or receipt on the watch;
+        check the target device's workout support and confirm after sync.
+
         Each call queues another copy, so do not push the same workout twice.
 
         Args:
